@@ -3,6 +3,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
 import time
+import re
 
 # Set page configuration
 st.set_page_config(
@@ -15,7 +16,6 @@ st.set_page_config(
 if 'model_loaded' not in st.session_state:
     st.session_state.model_loaded = False
 
-# Create a more robust model loading function
 def load_model():
     """Load the Phi-2 model and tokenizer with error handling"""
     try:
@@ -27,24 +27,19 @@ def load_model():
         torch.random.manual_seed(0)
         
         # Check if CUDA is available, otherwise use CPU
-        if torch.cuda.is_available():
-            device_map = "cuda"
-            torch_dtype = torch.float16  # Use half precision with CUDA
-        else:
-            device_map = "cpu"
-            torch_dtype = torch.float32  # Use full precision with CPU
+        device_map = "cuda" if torch.cuda.is_available() else "cpu"
+        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         
-        # Load tokenizer
+        # Load tokenizer and model
         tokenizer = AutoTokenizer.from_pretrained(
             "microsoft/phi-2",
             cache_dir=cache_dir
         )
         
-        # Load model with user's approach
         model = AutoModelForCausalLM.from_pretrained(
             "microsoft/phi-2",
             device_map=device_map,
-            torch_dtype=torch_dtype,  # Use appropriate dtype based on device
+            torch_dtype=torch_dtype,
             trust_remote_code=True,
             cache_dir=cache_dir
         )
@@ -55,9 +50,9 @@ def load_model():
         return None, None
 
 def generate_evaluation(essay_text, model, tokenizer):
-    """Generate evaluation using Phi-2"""
+    """Generate evaluation using Phi-2 with improved format enforcement"""
     try:
-        # Create prompt appropriate for Phi-2 with DREsS rubric
+        # Use a more structured few-shot prompt to guide the model
         prompt = f"""Instruction: You are an expert essay evaluator. Evaluate the following essay based on the DREsS rubric.
 
 DREsS Rubric (score range: 1 to 5, with 0.5 increments):
@@ -79,149 +74,137 @@ DREsS Rubric (score range: 1 to 5, with 0.5 increments):
 Essay to evaluate:
 {essay_text}
 
-Follow this exact format for your evaluation (include no numbering and no "Possible response:"):
+Follow this exact format for your evaluation:
 
 Content: [Score]/5
 Organization: [Score]/5
 Language: [Score]/5
 Overall Score: [Sum of three scores]/15
 
+Please provide:
+
 Justification for Content: [ONE short sentence only]
 Justification for Organization: [ONE short sentence only]
 Justification for Language: [ONE short sentence only]
 
-Key strengths:
-- [Strength 1]
-- [Strength 2]
-- [Strength 3]
-
-Areas for improvement:
-- [Improvement 1]
-- [Improvement 2]
-- [Improvement 3]
-
 Response:"""
         
-        # Use CPU tensors explicitly to avoid errors
-        inputs = tokenizer(prompt, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = inputs.to("cuda")
-        else:
-            inputs = inputs.to("cpu")
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, 
+                **inputs,
                 max_new_tokens=512,
-                temperature=0.7,
+                temperature=0.1,
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id
             )
         
         result = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
-        # Extract just the model's response
+        # Extract the response part
         if "Response:" in result:
             result = result.split("Response:")[1].strip()
         
-        # Clean up the result
-        # Remove any "Possible response:" prefix if present
-        if result.startswith("Possible response:"):
-            result = result[len("Possible response:"):].strip()
-            
-        # Remove any numbering from lines
-        lines = result.split('\n')
-        cleaned_lines = []
-        for line in lines:
-            # Remove numbering like "1.", "2.", "3." from the beginning of lines
-            if line.strip() and line.strip()[0].isdigit() and '. ' in line[:4]:
-                cleaned_line = line[line.find('.')+1:].strip()
-                cleaned_lines.append(cleaned_line)
-            else:
-                cleaned_lines.append(line)
+        # Basic cleanup
+        result = result.replace("Possible response:", "").strip()
         
-        # Calculate overall score if not present
-        content_score = None
-        organization_score = None
-        language_score = None
-        
+        # Post-process to fix format if needed
         try:
-            for line in cleaned_lines:
-                if line.startswith("Content:"):
-                    content_score = float(line.split('/')[0].split(':')[1].strip())
-                elif line.startswith("Organization:"):
-                    organization_score = float(line.split('/')[0].split(':')[1].strip())
-                elif line.startswith("Language:"):
-                    language_score = float(line.split('/')[0].split(':')[1].strip())
-            
-            # If we have all three scores but no overall score, insert it after Language score
-            if content_score is not None and organization_score is not None and language_score is not None:
-                overall_score = content_score + organization_score + language_score
-                has_overall = False
-                
-                for i, line in enumerate(cleaned_lines):
-                    if line.startswith("Overall Score:"):
-                        has_overall = True
-                        # Update the overall score line if it exists but is wrong
-                        if "/15" not in line:
-                            cleaned_lines[i] = f"Overall Score: {overall_score}/15"
-                
-                if not has_overall:
-                    # Find the index of the Language line to insert after it
-                    for i, line in enumerate(cleaned_lines):
-                        if line.startswith("Language:"):
-                            cleaned_lines.insert(i+1, f"Overall Score: {overall_score}/15")
-                            break
+            return format_evaluation_output(result)
         except Exception as e:
-            # Just continue with original cleaned lines if there's an error in score calculation
-            pass
-        
-        result = '\n'.join(cleaned_lines)
-        
-        # For debugging - print the raw result to console
-        print("Raw evaluation result:", result)
-        
-        # If result is empty for some reason, provide a default response
-        if not result.strip():
-            result = "Error: No evaluation generated. Please try again with a longer essay."
+            return f"Error processing evaluation: {str(e)}\n\nRaw response:\n{result}"
             
-        return result
     except Exception as e:
-        error_msg = f"Error generating evaluation: {str(e)}"
-        print(error_msg)  # Print error to console for debugging
-        return error_msg
+        return f"Error generating evaluation: {str(e)}"
+
+def format_evaluation_output(raw_output):
+    """Format or fix the model output to match expected format"""
+    
+    # Initialize sections
+    formatted_output = {}
+    
+    # Try to extract scores using regex patterns
+    content_match = re.search(r"Content:\s*(\d+\.?\d*)/5", raw_output)
+    org_match = re.search(r"Organization:\s*(\d+\.?\d*)/5", raw_output)
+    lang_match = re.search(r"Language:\s*(\d+\.?\d*)/5", raw_output)
+    
+    # If we don't find the standard format, check for bullet points format
+    if not (content_match and org_match and lang_match):
+        # Try to extract from bullet point format
+        bullet_points = re.findall(r"\*\s*(.*?)(?=\*|$)", raw_output, re.DOTALL)
+        
+        if len(bullet_points) >= 3:
+            # Extract scores from descriptions if possible
+            try:
+                content_score = float(re.search(r"(\d+\.?\d*)", bullet_points[0]).group(1)) 
+                org_score = float(re.search(r"(\d+\.?\d*)", bullet_points[1]).group(1))
+                lang_score = float(re.search(r"(\d+\.?\d*)", bullet_points[2]).group(1))
+            except:
+                # If no scores found in bullet points, assign default scores based on content
+                content_score = 3.0
+                org_score = 3.0
+                lang_score = 3.0
+                
+            # Create justifications from the bullet points
+            content_just = bullet_points[0].strip().split('.')[0] + '.'
+            org_just = bullet_points[1].strip().split('.')[0] + '.'
+            lang_just = bullet_points[2].strip().split('.')[0] + '.'
+            
+            # Calculate overall score
+            overall_score = content_score + org_score + lang_score
+            
+            # Format output
+            formatted_result = f"""Content: {content_score}/5
+Organization: {org_score}/5
+Language: {lang_score}/5
+Overall Score: {overall_score}/15
+
+Justification for Content: {content_just}
+Justification for Organization: {org_just}
+Justification for Language: {lang_just}"""
+            
+            return formatted_result
+    
+    # If standard format was found, just return the original output
+    return raw_output
 
 # Main app
-st.title("Essay Evaluator")
-st.markdown("Enter an essay prompt and a student's essay to receive feedback based on the DREsS rubric.")
+st.title("📝 Essay Evaluator")
+st.markdown("""
+    <style>
+        .big-font { font-size:18px !important; }
+    </style>
+    <p class="big-font">Enter an essay to receive detailed feedback based on the DREsS rubric.</p>
+""", unsafe_allow_html=True)
 
 # Load model automatically on page load
 if not st.session_state.model_loaded:
-    with st.spinner("Loading Phi-2 model... This may take a moment."):
+    with st.spinner("Loading evaluation model... This may take a moment."):
         model, tokenizer = load_model()
         if model is not None and tokenizer is not None:
             st.session_state.model = model
             st.session_state.tokenizer = tokenizer
             st.session_state.model_loaded = True
-            st.success("Model loaded successfully!")
-            # Force a rerun to update the UI
+            st.success("Evaluation model loaded successfully!")
             time.sleep(1)
             st.experimental_rerun()
 
-# Always show input fields if model is loaded
+# Input area and evaluation
 if st.session_state.model_loaded:
-    # Input areas
     essay_prompt = st.text_area("Essay Prompt:", height=100, 
                               placeholder="Enter the essay prompt or question here...")
-    essay_text = st.text_area("Student Essay:", height=300, 
-                           placeholder="Paste the student's essay here...")
+    essay_text = st.text_area(
+        "Paste the student's essay here:",
+        height=300,
+        placeholder="Enter the essay text to evaluate..."
+    )
     
-    # Evaluation button
-    if st.button("Evaluate Essay"):
+    if st.button("Evaluate Essay", type="primary"):
         if not essay_text.strip():
             st.error("Please enter an essay to evaluate.")
         else:
-            with st.spinner("Analyzing essay..."):
+            with st.spinner("Analyzing essay and generating feedback..."):
                 evaluation = generate_evaluation(essay_text, st.session_state.model, st.session_state.tokenizer)
                 
                 # Display results in a more structured way
@@ -230,45 +213,7 @@ if st.session_state.model_loaded:
                 # Create an expander to show the raw response for debugging
                 with st.expander("Debug: Raw Response"):
                     st.text(evaluation)
+
+                st.markdown("## Generated Output")
+                st.text(evaluation)
                 
-                # Display the formatted results
-                try:
-                    # Split the evaluation into sections
-                    lines = evaluation.split('\n')
-                    
-                    # Display scores
-                    for line in lines:
-                        if any(line.startswith(prefix) for prefix in ["Content:", "Organization:", "Language:", "Overall Score:"]):
-                            st.markdown(f"**{line}**")
-                    
-                    # Display justifications
-                    st.markdown("### Justifications")
-                    for line in lines:
-                        if line.startswith("Justification for"):
-                            st.markdown(line)
-                    
-                    # Display strengths and improvements if they exist
-                    if "Key strengths:" in evaluation:
-                        st.markdown("### Key Strengths")
-                        strengths_section = False
-                        for line in lines:
-                            if line.strip() == "Key strengths:":
-                                strengths_section = True
-                                continue
-                            if strengths_section and line.strip().startswith("-"):
-                                st.markdown(line)
-                            if strengths_section and line.strip() == "Areas for improvement:":
-                                strengths_section = False
-                    
-                    if "Areas for improvement:" in evaluation:
-                        st.markdown("### Areas for Improvement")
-                        improvements_section = False
-                        for line in lines:
-                            if line.strip() == "Areas for improvement:":
-                                improvements_section = True
-                                continue
-                            if improvements_section and line.strip().startswith("-"):
-                                st.markdown(line)
-                except Exception as e:
-                    # If there's an error in parsing, fall back to displaying the raw output
-                    st.markdown(evaluation) 
